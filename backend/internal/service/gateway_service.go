@@ -524,10 +524,11 @@ type GatewayService struct {
 	userGroupRateCache   *gocache.Cache
 	userGroupRateSF      singleflight.Group
 	modelsListCache      *gocache.Cache
-	modelsListCacheTTL   time.Duration
-	responseHeaderFilter *responseheaders.CompiledHeaderFilter
-	debugModelRouting    atomic.Bool
-	debugClaudeMimic     atomic.Bool
+	modelsListCacheTTL     time.Duration
+	responseHeaderFilter   *responseheaders.CompiledHeaderFilter
+	adaptiveThinkingCache  *gocache.Cache // adaptive thinking 探测结果缓存
+	debugModelRouting      atomic.Bool
+	debugClaudeMimic       atomic.Bool
 }
 
 // NewGatewayService creates a new GatewayService
@@ -580,6 +581,7 @@ func NewGatewayService(
 		userGroupRateCache:   gocache.New(userGroupRateTTL, time.Minute),
 		modelsListCache:      gocache.New(modelsListTTL, time.Minute),
 		modelsListCacheTTL:   modelsListTTL,
+		adaptiveThinkingCache: newAdaptiveThinkingCache(),
 		responseHeaderFilter: compileResponseHeaderFilter(cfg),
 	}
 	svc.debugModelRouting.Store(parseDebugEnvBool(os.Getenv("SUB2API_DEBUG_MODEL_ROUTING")))
@@ -4369,6 +4371,10 @@ func (s *GatewayService) forwardAnthropicAPIKeyPassthrough(
 	}
 	// 重试间复用同一请求体，避免每次 string(body) 产生额外分配。
 	setOpsUpstreamRequestBody(c, body)
+
+	// adaptive thinking 自动回退：检测上游是否支持 adaptive 模式，
+	// 不支持时自动转换为 enabled 模式，缓存过期后重新探测实现自动 fallback。
+	body = s.maybeConvertAdaptiveThinking(ctx, body, account, token, proxyURL)
 
 	var resp *http.Response
 	retryStart := time.Now()
