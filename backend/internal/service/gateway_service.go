@@ -314,8 +314,8 @@ func extractMissingToolReferenceName(respBody []byte) (string, bool) {
 	return missingToolName, true
 }
 
-func collectToolUseNamesFromMessages(messageList []any) map[string]struct{} {
-	toolUseNameSet := make(map[string]struct{})
+func collectReferencedToolNamesFromMessages(messageList []any) map[string]struct{} {
+	referencedToolNameSet := make(map[string]struct{})
 	for _, messageItem := range messageList {
 		messageMap, messageIsMap := messageItem.(map[string]any)
 		if !messageIsMap {
@@ -330,20 +330,44 @@ func collectToolUseNamesFromMessages(messageList []any) map[string]struct{} {
 			if !contentIsMap {
 				continue
 			}
+
 			contentType, _ := contentMap["type"].(string)
-			if contentType != "tool_use" {
-				continue
+			contentType = strings.TrimSpace(contentType)
+			switch contentType {
+			case "tool_use":
+				toolUseName, _ := contentMap["name"].(string)
+				toolUseName = strings.TrimSpace(toolUseName)
+				if toolUseName == "" {
+					continue
+				}
+				referencedToolNameSet[toolUseName] = struct{}{}
+			case "tool_result":
+				resultContentList, resultContentIsArray := contentMap["content"].([]any)
+				if !resultContentIsArray {
+					continue
+				}
+				for _, resultContentItem := range resultContentList {
+					resultContentMap, resultContentIsMap := resultContentItem.(map[string]any)
+					if !resultContentIsMap {
+						continue
+					}
+					resultContentType, _ := resultContentMap["type"].(string)
+					if strings.TrimSpace(resultContentType) != "tool_reference" {
+						continue
+					}
+					toolReferenceName, _ := resultContentMap["tool_name"].(string)
+					toolReferenceName = strings.TrimSpace(toolReferenceName)
+					if toolReferenceName == "" {
+						continue
+					}
+					referencedToolNameSet[toolReferenceName] = struct{}{}
+				}
 			}
-			toolUseName, _ := contentMap["name"].(string)
-			toolUseName = strings.TrimSpace(toolUseName)
-			if toolUseName == "" {
-				continue
-			}
-			toolUseNameSet[toolUseName] = struct{}{}
 		}
 	}
-	return toolUseNameSet
+	return referencedToolNameSet
 }
+
 
 func collectDefinedToolNames(toolDefinitionList []any) map[string]struct{} {
 	definedToolNameSet := make(map[string]struct{}, len(toolDefinitionList))
@@ -406,18 +430,18 @@ func appendMissingToolDefinitionsForRetry(requestBody []byte, requiredToolName s
 		return requestBody, false
 	}
 
-	toolUseNameSet := collectToolUseNamesFromMessages(messageList)
-	if len(toolUseNameSet) == 0 {
+	referencedToolNameSet := collectReferencedToolNamesFromMessages(messageList)
+	if len(referencedToolNameSet) == 0 {
 		return requestBody, false
 	}
-	if _, requiredToolReferenced := toolUseNameSet[requiredToolName]; !requiredToolReferenced {
+	if _, requiredToolReferenced := referencedToolNameSet[requiredToolName]; !requiredToolReferenced {
 		return requestBody, false
 	}
 
 	var toolDefinitionList []any
 	toolValue, hasTools := requestEnvelope["tools"]
 	if !hasTools || toolValue == nil {
-		toolDefinitionList = make([]any, 0, len(toolUseNameSet))
+		toolDefinitionList = make([]any, 0, len(referencedToolNameSet))
 	} else {
 		parsedToolDefinitionList, toolsAreArray := toolValue.([]any)
 		if !toolsAreArray {
@@ -427,12 +451,12 @@ func appendMissingToolDefinitionsForRetry(requestBody []byte, requiredToolName s
 	}
 
 	definedToolNameSet := collectDefinedToolNames(toolDefinitionList)
-	missingToolNameList := make([]string, 0, len(toolUseNameSet))
-	for toolUseName := range toolUseNameSet {
-		if _, hasDefinition := definedToolNameSet[toolUseName]; hasDefinition {
+	missingToolNameList := make([]string, 0, len(referencedToolNameSet))
+	for referencedToolName := range referencedToolNameSet {
+		if _, hasDefinition := definedToolNameSet[referencedToolName]; hasDefinition {
 			continue
 		}
-		missingToolNameList = append(missingToolNameList, toolUseName)
+		missingToolNameList = append(missingToolNameList, referencedToolName)
 	}
 	if len(missingToolNameList) == 0 {
 		return requestBody, false

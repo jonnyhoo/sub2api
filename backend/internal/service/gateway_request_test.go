@@ -731,7 +731,48 @@ func TestAppendMissingToolDefinitionsForRetry_NoOpWhenNoMatchingToolUse(t *testi
 	require.Equal(t, string(requestBody), string(patchedBody))
 }
 
+
+func TestAppendMissingToolDefinitionsForRetry_AddsMissingToolFromToolReference(t *testing.T) {
+	requestBody := []byte(`{
+		"messages":[
+			{
+				"role":"user",
+				"content":[
+					{
+						"type":"tool_result",
+						"tool_use_id":"toolu_1",
+						"content":[
+							{"type":"tool_reference","tool_name":"mcp__ssh__ssh_connect"},
+							{"type":"tool_reference","tool_name":"mcp__ssh__ssh_disconnect"}
+						]
+					}
+				]
+			}
+		]
+	}`)
+
+	patchedBody, patched := appendMissingToolDefinitionsForRetry(requestBody, "mcp__ssh__ssh_connect")
+	require.True(t, patched)
+
+	var req map[string]any
+	require.NoError(t, json.Unmarshal(patchedBody, &req))
+	tools, ok := req["tools"].([]any)
+	require.True(t, ok)
+	require.Len(t, tools, 2)
+
+	nameSet := map[string]bool{}
+	for _, item := range tools {
+		toolMap, ok := item.(map[string]any)
+		require.True(t, ok)
+		name, _ := toolMap["name"].(string)
+		nameSet[name] = true
+	}
+	require.True(t, nameSet["mcp__ssh__ssh_connect"])
+	require.True(t, nameSet["mcp__ssh__ssh_disconnect"])
+}
+
 // ============ Task 7.5: Benchmark 测试 ============
+
 
 // parseGatewayRequestOld 是基于完整 json.Unmarshal 的旧实现，用于 benchmark 对比基线。
 // 核心路径：先 Unmarshal 到 map[string]any，再逐字段提取。
