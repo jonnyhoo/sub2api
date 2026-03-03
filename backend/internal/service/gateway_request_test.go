@@ -638,6 +638,99 @@ func TestParseGatewayRequest_MaxTokensBoundary(t *testing.T) {
 	}
 }
 
+
+func TestExtractMissingToolReferenceName_DirectMessage(t *testing.T) {
+	respBody := []byte(`{"type":"error","error":{"type":"invalid_request_error","message":"Tool reference 'mcp__ssh__ssh_connect' not found in available tools"}}`)
+
+	toolName, ok := extractMissingToolReferenceName(respBody)
+	require.True(t, ok)
+	require.Equal(t, "mcp__ssh__ssh_connect", toolName)
+}
+
+func TestExtractMissingToolReferenceName_NestedJSONMessage(t *testing.T) {
+	respBody := []byte(`{"type":"error","error":{"type":"invalid_request_error","message":"{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Tool reference 'mcp__ssh__ssh_connect' not found in available tools\"}}"}}`)
+
+	toolName, ok := extractMissingToolReferenceName(respBody)
+	require.True(t, ok)
+	require.Equal(t, "mcp__ssh__ssh_connect", toolName)
+}
+
+func TestExtractMissingToolReferenceName_NonTargetError(t *testing.T) {
+	respBody := []byte(`{"type":"error","error":{"type":"invalid_request_error","message":"invalid max_tokens"}}`)
+
+	toolName, ok := extractMissingToolReferenceName(respBody)
+	require.False(t, ok)
+	require.Equal(t, "", toolName)
+}
+
+func TestAppendMissingToolDefinitionsForRetry_AddsMissingToolWhenToolsAbsent(t *testing.T) {
+	requestBody := []byte(`{
+		"messages":[
+			{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"mcp__ssh__ssh_connect","input":{"host":"example.com"}}]}
+		]
+	}`)
+
+	patchedBody, patched := appendMissingToolDefinitionsForRetry(requestBody, "mcp__ssh__ssh_connect")
+	require.True(t, patched)
+
+	var req map[string]any
+	require.NoError(t, json.Unmarshal(patchedBody, &req))
+
+	tools, ok := req["tools"].([]any)
+	require.True(t, ok)
+	require.Len(t, tools, 1)
+
+	tool0, ok := tools[0].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "mcp__ssh__ssh_connect", tool0["name"])
+	require.Equal(t, "Auto-injected placeholder tool definition for relay recovery.", tool0["description"])
+
+	inputSchema, ok := tool0["input_schema"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "object", inputSchema["type"])
+	require.Equal(t, true, inputSchema["additionalProperties"])
+}
+
+func TestAppendMissingToolDefinitionsForRetry_DoesNotDuplicateExistingTool(t *testing.T) {
+	requestBody := []byte(`{
+		"messages":[
+			{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"mcp__ssh__ssh_connect","input":{}}]}
+		],
+		"tools":[
+			{"name":"mcp__ssh__ssh_connect","description":"existing","input_schema":{"type":"object"}}
+		]
+	}`)
+
+	patchedBody, patched := appendMissingToolDefinitionsForRetry(requestBody, "mcp__ssh__ssh_connect")
+	require.False(t, patched)
+	require.Equal(t, string(requestBody), string(patchedBody))
+}
+
+func TestAppendMissingToolDefinitionsForRetry_NoOpWhenToolsIsNotArray(t *testing.T) {
+	requestBody := []byte(`{
+		"messages":[
+			{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"mcp__ssh__ssh_connect","input":{}}]}
+		],
+		"tools": {"name":"invalid"}
+	}`)
+
+	patchedBody, patched := appendMissingToolDefinitionsForRetry(requestBody, "mcp__ssh__ssh_connect")
+	require.False(t, patched)
+	require.Equal(t, string(requestBody), string(patchedBody))
+}
+
+func TestAppendMissingToolDefinitionsForRetry_NoOpWhenNoMatchingToolUse(t *testing.T) {
+	requestBody := []byte(`{
+		"messages":[
+			{"role":"assistant","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}
+		]
+	}`)
+
+	patchedBody, patched := appendMissingToolDefinitionsForRetry(requestBody, "mcp__ssh__ssh_connect")
+	require.False(t, patched)
+	require.Equal(t, string(requestBody), string(patchedBody))
+}
+
 // ============ Task 7.5: Benchmark 测试 ============
 
 // parseGatewayRequestOld 是基于完整 json.Unmarshal 的旧实现，用于 benchmark 对比基线。

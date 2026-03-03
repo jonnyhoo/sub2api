@@ -291,12 +291,184 @@ func isClaudeCodeCredentialScopeError(msg string) bool {
 		strings.Contains(m, "cannot be used for other api requests")
 }
 
+func extractMissingToolReferenceName(respBody []byte) (string, bool) {
+	upstreamMessage := strings.TrimSpace(extractUpstreamErrorMessage(respBody))
+	if upstreamMessage == "" {
+		return "", false
+	}
+
+	sanitizedMessage := sanitizeUpstreamErrorMessage(upstreamMessage)
+	if sanitizedMessage == "" {
+		return "", false
+	}
+
+	matches := missingToolReferenceErrorRegex.FindStringSubmatch(sanitizedMessage)
+	if len(matches) < 2 {
+		return "", false
+	}
+
+	missingToolName := strings.TrimSpace(matches[1])
+	if missingToolName == "" {
+		return "", false
+	}
+	return missingToolName, true
+}
+
+func collectToolUseNamesFromMessages(messageList []any) map[string]struct{} {
+	toolUseNameSet := make(map[string]struct{})
+	for _, messageItem := range messageList {
+		messageMap, messageIsMap := messageItem.(map[string]any)
+		if !messageIsMap {
+			continue
+		}
+		contentList, contentIsArray := messageMap["content"].([]any)
+		if !contentIsArray {
+			continue
+		}
+		for _, contentItem := range contentList {
+			contentMap, contentIsMap := contentItem.(map[string]any)
+			if !contentIsMap {
+				continue
+			}
+			contentType, _ := contentMap["type"].(string)
+			if contentType != "tool_use" {
+				continue
+			}
+			toolUseName, _ := contentMap["name"].(string)
+			toolUseName = strings.TrimSpace(toolUseName)
+			if toolUseName == "" {
+				continue
+			}
+			toolUseNameSet[toolUseName] = struct{}{}
+		}
+	}
+	return toolUseNameSet
+}
+
+func collectDefinedToolNames(toolDefinitionList []any) map[string]struct{} {
+	definedToolNameSet := make(map[string]struct{}, len(toolDefinitionList))
+	for _, toolDefinitionItem := range toolDefinitionList {
+		toolDefinitionMap, toolDefinitionIsMap := toolDefinitionItem.(map[string]any)
+		if !toolDefinitionIsMap {
+			continue
+		}
+
+		definedToolName, _ := toolDefinitionMap["name"].(string)
+		definedToolName = strings.TrimSpace(definedToolName)
+		if definedToolName != "" {
+			definedToolNameSet[definedToolName] = struct{}{}
+			continue
+		}
+
+		functionDefinition, hasFunctionDefinition := toolDefinitionMap["function"].(map[string]any)
+		if !hasFunctionDefinition {
+			continue
+		}
+		functionName, _ := functionDefinition["name"].(string)
+		functionName = strings.TrimSpace(functionName)
+		if functionName == "" {
+			continue
+		}
+		definedToolNameSet[functionName] = struct{}{}
+	}
+	return definedToolNameSet
+}
+
+func buildMissingToolPlaceholder(toolName string) map[string]any {
+	return map[string]any{
+		"name":        toolName,
+		"description": "Auto-injected placeholder tool definition for relay recovery.",
+		"input_schema": map[string]any{
+			"type":                 "object",
+			"properties":           map[string]any{},
+			"additionalProperties": true,
+		},
+	}
+}
+
+func appendMissingToolDefinitionsForRetry(requestBody []byte, requiredToolName string) ([]byte, bool) {
+	requiredToolName = strings.TrimSpace(requiredToolName)
+	if len(requestBody) == 0 || requiredToolName == "" {
+		return requestBody, false
+	}
+
+	var requestEnvelope map[string]any
+	if err := json.Unmarshal(requestBody, &requestEnvelope); err != nil {
+		return requestBody, false
+	}
+
+	messageValue, hasMessages := requestEnvelope["messages"]
+	if !hasMessages {
+		return requestBody, false
+	}
+	messageList, messagesAreArray := messageValue.([]any)
+	if !messagesAreArray || len(messageList) == 0 {
+		return requestBody, false
+	}
+
+	toolUseNameSet := collectToolUseNamesFromMessages(messageList)
+	if len(toolUseNameSet) == 0 {
+		return requestBody, false
+	}
+	if _, requiredToolReferenced := toolUseNameSet[requiredToolName]; !requiredToolReferenced {
+		return requestBody, false
+	}
+
+	var toolDefinitionList []any
+	toolValue, hasTools := requestEnvelope["tools"]
+	if !hasTools || toolValue == nil {
+		toolDefinitionList = make([]any, 0, len(toolUseNameSet))
+	} else {
+		parsedToolDefinitionList, toolsAreArray := toolValue.([]any)
+		if !toolsAreArray {
+			return requestBody, false
+		}
+		toolDefinitionList = parsedToolDefinitionList
+	}
+
+	definedToolNameSet := collectDefinedToolNames(toolDefinitionList)
+	missingToolNameList := make([]string, 0, len(toolUseNameSet))
+	for toolUseName := range toolUseNameSet {
+		if _, hasDefinition := definedToolNameSet[toolUseName]; hasDefinition {
+			continue
+		}
+		missingToolNameList = append(missingToolNameList, toolUseName)
+	}
+	if len(missingToolNameList) == 0 {
+		return requestBody, false
+	}
+	sort.Strings(missingToolNameList)
+
+	requiredToolMissing := false
+	for _, missingToolName := range missingToolNameList {
+		if missingToolName == requiredToolName {
+			requiredToolMissing = true
+			break
+		}
+	}
+	if !requiredToolMissing {
+		return requestBody, false
+	}
+
+	for _, missingToolName := range missingToolNameList {
+		toolDefinitionList = append(toolDefinitionList, buildMissingToolPlaceholder(missingToolName))
+	}
+	requestEnvelope["tools"] = toolDefinitionList
+
+	patchedBody, err := json.Marshal(requestEnvelope)
+	if err != nil {
+		return requestBody, false
+	}
+	return patchedBody, true
+}
+
 // sseDataRe matches SSE data lines with optional whitespace after colon.
 // Some upstream APIs return non-standard "data:" without space (should be "data: ").
 var (
-	sseDataRe            = regexp.MustCompile(`^data:\s*`)
-	sessionIDRegex       = regexp.MustCompile(`session_([a-f0-9-]{36})`)
-	claudeCliUserAgentRe = regexp.MustCompile(`^claude-cli/\d+\.\d+\.\d+`)
+	sseDataRe                    = regexp.MustCompile(`^data:\s*`)
+	sessionIDRegex               = regexp.MustCompile(`session_([a-f0-9-]{36})`)
+	claudeCliUserAgentRe         = regexp.MustCompile(`^claude-cli/\d+\.\d+\.\d+`)
+	missingToolReferenceErrorRegex = regexp.MustCompile(`(?i)tool reference '([^']+)' not found in available tools`)
 
 	// claudeCodePromptPrefixes 用于检测 Claude Code 系统提示词的前缀列表
 	// 支持多种变体：标准版、Agent SDK 版、Explore Agent 版、Compact 版等
@@ -4133,6 +4305,64 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 					resp.Body = io.NopCloser(bytes.NewReader(respBody))
 					break
 				}
+
+				if missingToolName, missingToolRef := extractMissingToolReferenceName(respBody); missingToolRef {
+					patchedBody, patched := appendMissingToolDefinitionsForRetry(body, missingToolName)
+					if patched {
+						logger.LegacyPrintf("service.gateway", "Account %d: detected missing tool reference %q, retrying with injected tool definitions", account.ID, missingToolName)
+						appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+							Platform:           account.Platform,
+							AccountID:          account.ID,
+							AccountName:        account.Name,
+							UpstreamStatusCode: resp.StatusCode,
+							UpstreamRequestID:  resp.Header.Get("x-request-id"),
+							Kind:               "tool_reference_missing_retry",
+							Message:            extractUpstreamErrorMessage(respBody),
+							Detail:             missingToolName,
+						})
+
+						retryReq, buildErr := s.buildUpstreamRequest(ctx, c, account, patchedBody, token, tokenType, reqModel, reqStream, shouldMimicClaudeCode)
+						if buildErr == nil {
+							retryResp, retryErr := s.httpUpstream.DoWithTLS(retryReq, proxyURL, account.ID, account.Concurrency, account.IsTLSFingerprintEnabled())
+							if retryErr == nil {
+								if retryResp.StatusCode < 400 {
+									logger.LegacyPrintf("service.gateway", "Account %d: missing tool reference retry succeeded: tool=%q status=%d", account.ID, missingToolName, retryResp.StatusCode)
+									resp = retryResp
+									body = patchedBody
+									setOpsUpstreamRequestBody(c, body)
+									break
+								}
+
+								retryRespBody, _ := io.ReadAll(io.LimitReader(retryResp.Body, 2<<20))
+								_ = retryResp.Body.Close()
+								appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+									Platform:           account.Platform,
+									AccountID:          account.ID,
+									AccountName:        account.Name,
+									UpstreamStatusCode: retryResp.StatusCode,
+									UpstreamRequestID:  retryResp.Header.Get("x-request-id"),
+									Kind:               "tool_reference_missing_retry_failed",
+									Message:            extractUpstreamErrorMessage(retryRespBody),
+									Detail:             missingToolName,
+								})
+								logger.LegacyPrintf("service.gateway", "Account %d: missing tool reference retry failed with status=%d, fallback to original response", account.ID, retryResp.StatusCode)
+							} else {
+								if retryResp != nil && retryResp.Body != nil {
+									_ = retryResp.Body.Close()
+								}
+								appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+									Platform:           account.Platform,
+									AccountID:          account.ID,
+									AccountName:        account.Name,
+									UpstreamStatusCode: 0,
+									Kind:               "tool_reference_missing_retry_request_error",
+									Message:            sanitizeUpstreamErrorMessage(retryErr.Error()),
+								})
+								logger.LegacyPrintf("service.gateway", "Account %d: missing tool reference retry request failed: %v", account.ID, retryErr)
+							}
+						}
+					}
+				}
 				// 不是thinking签名错误，恢复响应体
 				resp.Body = io.NopCloser(bytes.NewReader(respBody))
 			}
@@ -4408,6 +4638,74 @@ func (s *GatewayService) forwardAnthropicAPIKeyPassthrough(
 				},
 			})
 			return nil, fmt.Errorf("upstream request failed: %s", safeErr)
+		}
+
+		if resp.StatusCode == 400 {
+			respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+			if readErr == nil {
+				_ = resp.Body.Close()
+				if missingToolName, missingToolRef := extractMissingToolReferenceName(respBody); missingToolRef {
+					patchedBody, patched := appendMissingToolDefinitionsForRetry(body, missingToolName)
+					if patched {
+						logger.LegacyPrintf("service.gateway", "Anthropic passthrough account %d: detected missing tool reference %q, retrying with injected tool definitions", account.ID, missingToolName)
+						appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+							Platform:           account.Platform,
+							AccountID:          account.ID,
+							AccountName:        account.Name,
+							UpstreamStatusCode: resp.StatusCode,
+							UpstreamRequestID:  resp.Header.Get("x-request-id"),
+							Passthrough:        true,
+							Kind:               "tool_reference_missing_retry",
+							Message:            extractUpstreamErrorMessage(respBody),
+							Detail:             missingToolName,
+						})
+
+						retryReq, buildErr := s.buildUpstreamRequestAnthropicAPIKeyPassthrough(ctx, c, account, patchedBody, token)
+						if buildErr == nil {
+							retryResp, retryErr := s.httpUpstream.DoWithTLS(retryReq, proxyURL, account.ID, account.Concurrency, account.IsTLSFingerprintEnabled())
+							if retryErr == nil {
+								if retryResp.StatusCode < 400 {
+									logger.LegacyPrintf("service.gateway", "Anthropic passthrough account %d: missing tool reference retry succeeded: tool=%q status=%d", account.ID, missingToolName, retryResp.StatusCode)
+									resp = retryResp
+									body = patchedBody
+									setOpsUpstreamRequestBody(c, body)
+									break
+								}
+
+								retryRespBody, _ := io.ReadAll(io.LimitReader(retryResp.Body, 2<<20))
+								_ = retryResp.Body.Close()
+								appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+									Platform:           account.Platform,
+									AccountID:          account.ID,
+									AccountName:        account.Name,
+									UpstreamStatusCode: retryResp.StatusCode,
+									UpstreamRequestID:  retryResp.Header.Get("x-request-id"),
+									Passthrough:        true,
+									Kind:               "tool_reference_missing_retry_failed",
+									Message:            extractUpstreamErrorMessage(retryRespBody),
+									Detail:             missingToolName,
+								})
+								logger.LegacyPrintf("service.gateway", "Anthropic passthrough account %d: missing tool reference retry failed with status=%d, fallback to original response", account.ID, retryResp.StatusCode)
+							} else {
+								if retryResp != nil && retryResp.Body != nil {
+									_ = retryResp.Body.Close()
+								}
+								appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+									Platform:           account.Platform,
+									AccountID:          account.ID,
+									AccountName:        account.Name,
+									UpstreamStatusCode: 0,
+									Passthrough:        true,
+									Kind:               "tool_reference_missing_retry_request_error",
+									Message:            sanitizeUpstreamErrorMessage(retryErr.Error()),
+								})
+								logger.LegacyPrintf("service.gateway", "Anthropic passthrough account %d: missing tool reference retry request failed: %v", account.ID, retryErr)
+							}
+						}
+					}
+				}
+				resp.Body = io.NopCloser(bytes.NewReader(respBody))
+			}
 		}
 
 		// 透传分支禁止 400 请求体降级重试（该重试会改写请求体）
@@ -4797,7 +5095,6 @@ func (s *GatewayService) parseSSEUsagePassthrough(data string, usage *ClaudeUsag
 			usage.CacheCreationInputTokens = int(msgUsage.Get("cache_creation_input_tokens").Int())
 			usage.CacheReadInputTokens = int(msgUsage.Get("cache_read_input_tokens").Int())
 
-			// 保持与通用解析一致：message_start 允许覆盖 5m/1h 明细（包括 0）。
 			cc5m := msgUsage.Get("cache_creation.ephemeral_5m_input_tokens")
 			cc1h := msgUsage.Get("cache_creation.ephemeral_1h_input_tokens")
 			if cc5m.Exists() || cc1h.Exists() {
