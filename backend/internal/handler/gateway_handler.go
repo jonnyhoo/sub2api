@@ -1141,7 +1141,8 @@ func (h *GatewayHandler) CountTokens(c *gin.Context) {
 	account, err := h.gatewayService.SelectAccountForModel(c.Request.Context(), apiKey.GroupID, sessionHash, parsedReq.Model)
 	if err != nil {
 		reqLog.Warn("gateway.count_tokens_select_account_failed", zap.Error(err))
-		h.errorResponse(c, http.StatusServiceUnavailable, "api_error", "Service temporarily unavailable")
+		status, errType, message := mapCountTokensSelectAccountError(err)
+		h.errorResponse(c, status, errType, message)
 		return
 	}
 	setOpsSelectedAccount(c, account.ID, account.Platform)
@@ -1152,6 +1153,15 @@ func (h *GatewayHandler) CountTokens(c *gin.Context) {
 		// 错误响应已在 ForwardCountTokens 中处理
 		return
 	}
+}
+
+func mapCountTokensSelectAccountError(err error) (status int, errType, message string) {
+	// Keep claude_code_only strict for /v1/messages, but return not_found on
+	// count_tokens so compatible clients can gracefully fallback to local estimate.
+	if errors.Is(err, service.ErrClaudeCodeOnly) {
+		return http.StatusNotFound, "not_found_error", "count_tokens endpoint is not supported by upstream"
+	}
+	return http.StatusServiceUnavailable, "api_error", "Service temporarily unavailable"
 }
 
 // InterceptType 表示请求拦截类型
